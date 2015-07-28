@@ -16,6 +16,7 @@
 
 package shapeless
 
+import scala.annotation.tailrec
 import scala.language.experimental.macros
 
 import scala.collection.immutable.ListMap
@@ -100,6 +101,19 @@ class LazyMacros(val c: whitebox.Context) {
 object LazyMacros {
   var dcRef: Option[DerivationContext] = None
 
+  object Debug {
+    var startTime = 0L
+    var count = 0
+    var verbose = false
+
+    def enable(): Unit = macro enableImpl
+    def enableImpl(c: whitebox.Context)(): c.Expr[Unit] = {
+      import c.universe._
+      verbose = true
+      c.Expr(q"()")
+    }
+  }
+
   def deriveInstance(c: whitebox.Context)(tpe: c.Type, strict: Boolean): c.Tree = {
     val (dc, root) =
       dcRef match {
@@ -110,6 +124,16 @@ object LazyMacros {
         case Some(dc) =>
           (DerivationContext.establish(dc, c), false)
       }
+
+    if (Debug.verbose && root) {
+      if (Debug.startTime == 0L)
+        Debug.startTime = System.currentTimeMillis()
+      Debug.count += 1
+      println(s"Deriving $tpe ${Seq(Debug.count.toString, ((System.currentTimeMillis() - Debug.startTime) / 1000.0).toString).mkString("(", ", ", ")")}")
+    }
+
+    if (Debug.verbose)
+      println(s"Deriving $tpe")
 
     if (root)
       // Sometimes corrupted, and slows things too
@@ -183,7 +207,8 @@ trait LazyDefinitions {
     name: TermName,
     symbol: Symbol,
     inst: Option[Tree],
-    actualTpe: Type
+    actualTpe: Type,
+    dependsOn: List[Type]
   ) {
     def ident = Ident(symbol)
   }
@@ -193,7 +218,7 @@ trait LazyDefinitions {
       val nme = TermName(c.freshName("inst"))
       val sym = c.internal.setInfo(c.internal.newTermSymbol(NoSymbol, nme), instTpe)
 
-      new Instance(instTpe, nme, sym, None, instTpe)
+      new Instance(instTpe, nme, sym, None, instTpe, Nil)
     }
   }
 
@@ -241,7 +266,7 @@ trait DerivationContext extends shapeless.CaseClassMacros with LazyDefinitions {
 
   object State {
     final val ctx0: ctx.type = ctx
-    val empty = State("", ListMap.empty, Nil)
+    val empty = State("", ListMap.empty, Nil, Nil)
 
     private var current = Option.empty[State]
     private var addExtensions = List.empty[ExtensionWithState[ctx.type, _]]
@@ -267,15 +292,15 @@ trait DerivationContext extends shapeless.CaseClassMacros with LazyDefinitions {
           State.current = former
         }
 
-      if (tree == EmptyTree || addExtensions.nonEmpty) None
-      else Some((state0, tree))
-    }
+        if (tree == EmptyTree || addExtensions.nonEmpty) None
+        else Some((state0, tree))
+      }
 
     def deriveInstance(instTpe0: Type, root: Boolean, strict: Boolean): Tree = {
       if (root) {
         assert(current.isEmpty)
         val open = c.openImplicits
-        val name = if (open.length > 1) open(1).sym.name.toTermName.toString else if (strict) "strict" else "lazy"
+        val name = if (open.length > 1) open(1).sym.name.toTermName.toString else "lazy"
         current = Some(empty.copy(name = name))
       }
 
@@ -296,15 +321,63 @@ trait DerivationContext extends shapeless.CaseClassMacros with LazyDefinitions {
   case class State(
     name: String,
     dict: ListMap[TypeWrapper, Instance],
+    open: List[Instance],
     extensions: List[ExtensionWithState[ctx.type, _]]
   ) {
-    def addInstance(d: Instance): State =
-      copy(dict = dict.updated(TypeWrapper(d.instTpe), d))
+    def addDependency(tpe: Type): State = {
+      import scala.::
+      val open0 = open match {
+        case Nil => Nil
+        case h :: t => h.copy(dependsOn = if (h.instTpe =:= tpe || h.dependsOn.exists(_ =:= tpe)) h.dependsOn else tpe :: h.dependsOn) :: t
+      }
+      copy(open = open0)
+    }
+    private def update(inst: Instance): State =
+      copy(dict = dict.updated(TypeWrapper(inst.instTpe), inst))
+    def openInst(tpe: Type): (State, Instance) = {
+      val inst = Instance(tpe)
+      val state0 = addDependency(tpe)
+      if (LazyMacros.Debug.verbose)
+        println(s"Opening $tpe")
+      (state0.copy(open = inst :: state0.open).update(inst), inst)
+    }
+
+    def closeInst(tpe: Type, tree: Tree, actualTpe: Type): (State, Instance) = {
+      assert(open.nonEmpty)
+      assert(open.head.instTpe =:= tpe)
+      val instance = open.head
+      val sym = c.internal.setInfo(instance.symbol, actualTpe)
+      val instance0 = instance.copy(inst = Some(tree), actualTpe = actualTpe, symbol = sym)
+      if (LazyMacros.Debug.verbose)
+        println(s"Closing $tpe")
+      (copy(open = open.tail).update(instance0), instance0)
+    }
 
     def lookup(instTpe: Type): Either[State, (State, Instance)] =
-      dict.get(TypeWrapper(instTpe))
-        .map((this, _))
-        .toRight(addInstance(Instance(instTpe)))
+      dict.get(TypeWrapper(instTpe)).map((this, _)) match {
+        case Some((s, i)) => Right((s.addDependency(instTpe), i))
+        case None => Left(openInst(instTpe)._1)
+      }
+
+
+    def dependsOn(tpe: Type): List[Instance] = {
+      import scala.::
+      def helper(tpes: List[List[Type]], acc: List[Instance]): List[Instance] =
+        tpes match {
+          case Nil => acc
+          case Nil :: t =>
+            helper(t, acc)
+          case (h :: t0) :: t =>
+            if (acc.exists(_.instTpe =:= h))
+              helper(t0 :: t, acc)
+            else {
+              val inst = dict(TypeWrapper(h))
+              helper(inst.dependsOn :: t0 :: t, inst :: acc)
+            }
+        }
+
+      helper(List(List(tpe)), Nil)
+    }
   }
 
   def stripRefinements(tpe: Type): Option[Type] =
@@ -317,7 +390,7 @@ trait DerivationContext extends shapeless.CaseClassMacros with LazyDefinitions {
     resolve0(state0)(inst.instTpe)
       .filter{case (_, tree, _) => !tree.equalsStructure(inst.ident) }
       .map {case (state1, extInst, actualTpe) =>
-        setTree(state1)(inst.instTpe, extInst, actualTpe)
+        state1.closeInst(inst.instTpe, extInst, actualTpe)
       }
 
   def resolve0(state0: State)(instTpe: Type): Option[(State, Tree, Type)] = {
@@ -330,13 +403,6 @@ trait DerivationContext extends shapeless.CaseClassMacros with LazyDefinitions {
     extInstOpt.map {case (state1, extInst) =>
       (state1, extInst, extInst.tpe.finalResultType)
     }
-  }
-
-  def setTree(state: State)(tpe: Type, tree: Tree, actualTpe: Type): (State, Instance) = {
-    val instance = state.dict(TypeWrapper(tpe))
-    val sym = c.internal.setInfo(instance.symbol, actualTpe)
-    val instance0 = instance.copy(inst = Some(tree), actualTpe = actualTpe, symbol = sym)
-    (state.addInstance(instance0), instance0)
   }
 
   def derive(state0: State)(instTpe0: Type): Either[String, (State, Instance)] = {
@@ -353,8 +419,8 @@ trait DerivationContext extends shapeless.CaseClassMacros with LazyDefinitions {
     val result: Either[String, (State, Instance)] =
       fromExtensions.getOrElse {
         state0.lookup(instTpe0).left.flatMap { state =>
-          val inst = Instance(instTpe0)
-          resolve(state.addInstance(inst))(inst)
+          val inst = state.dict(TypeWrapper(instTpe0))
+          resolve(state)(inst)
             .toRight(s"Unable to derive $instTpe0")
         }
       }
@@ -384,37 +450,172 @@ trait DerivationContext extends shapeless.CaseClassMacros with LazyDefinitions {
     }
   }
 
-  def mkInstances(state: State)(primaryTpe: Type): (Tree, Type) = {
-    val instances = state.dict.values.toList
+  class Inliner(sym: Name, inlined: Tree) extends Transformer {
+    var count = 0
 
-    val (from, to) = instances.map { d => (d.symbol, NoSymbol) }.unzip
+    override def transform(tree: Tree): Tree =
+      super.transform {
+        tree match {
+          case Ident(sym0) if sym0 == sym =>
+            count += 1
+            inlined
+          case t => t
+        }
+      }
+  }
 
-    val instTrees =
-      instances.map { instance =>
-        import instance._
-        inst match {
-          case Some(inst) =>
-            val cleanInst0 = c.untypecheck(c.internal.substituteSymbols(inst, from, to))
-            val cleanInst = new StripUnApplyNodes().transform(cleanInst0)
-            q"""lazy val $name: $actualTpe = $cleanInst.asInstanceOf[$actualTpe]"""
-          case None =>
-            abort(s"Uninitialized $instTpe lazy implicit")
+  object Instances {
+    // These seem not to be dealiased as expected (try with Functor[Some] from the examples),
+    // and are not inlined correctly.
+    def hasHKAliases(tpe: Type) =
+      tpe match {
+        case TypeRef(_, _, args0) =>
+          args0.map(_.dealias).filter(_.takesTypeArgs).map(_.etaExpand).exists {
+            case PolyType(args, pt) =>
+              true
+            case _ => false
+          }
+        case _ => false
+      }
+
+    def canBeInlined(t: (Instance, List[String])): Boolean = {
+      val (inst, dependees) = t
+      inst.dependsOn.isEmpty && dependees.lengthCompare(1) == 0
+    }
+
+    def priorityCanBeSubstituted(t: (Instance, List[String])): Option[Tree] = {
+      val (inst, _) = t
+      if (inst.dependsOn.nonEmpty)
+        None
+      else
+        inst.inst.get match {
+          case q"$method[..$tp](shapeless.Strict.apply[..$tpa](_root_.shapeless.Priority.High[..${List(tph: TypeTree)}]($something)))"
+            if tph.tpe =:= inst.actualTpe => Some(something)
+          case other =>
+            None
+        }
+    }
+
+    def apply(state: State, primaryTpe: Type): Instances = {
+      val instances = state.dependsOn(primaryTpe)
+      var m = Map.empty[String, List[String]]
+
+      for (inst <- instances) {
+        val name = inst.name.toString
+
+        for (depTpe <- inst.dependsOn) {
+          val depInst = state.dict(TypeWrapper(depTpe))
+          val depName = depInst.name.toString
+          m += depName -> (name :: m.getOrElse(depName, Nil))
         }
       }
 
-    val primaryInstance = state.dict(TypeWrapper(primaryTpe))
-    val primaryNme = primaryInstance.name
-    val clsName = TypeName(c.freshName(state.name))
+      Instances(
+        instances.map(inst => inst.name.toString -> ((inst, m.getOrElse(inst.name.toString, Nil), !hasHKAliases(inst.instTpe)))).toMap,
+        state.dict(TypeWrapper(primaryTpe)).name.toString
+      )
+    }
+  }
 
-    val tree =
-      q"""
-        final class $clsName extends _root_.scala.Serializable {
-          ..$instTrees
+  case class Instances(
+    dict: Map[String, (Instance, List[String], Boolean)],
+    root: String
+  ) {
+    import Instances._
+
+    def prioritySubstitute: Option[Instances] =
+      dict.iterator
+        .map{case (k, v @ (inst, deps, canBeInlined)) => (k, v, priorityCanBeSubstituted((inst, deps)))}
+        .collectFirst { case (k, (inst, dependees, canBeInlined), Some(tree)) =>
+          copy(dict = dict.updated(k, (inst.copy(inst = Some(tree)), dependees, canBeInlined)))
         }
-        (new $clsName).$primaryNme
-       """
-    val actualType = primaryInstance.actualTpe
 
-    (tree, actualType)
+    def inline: Option[Instances] =
+      dict.find{case (k, v @ (inst, deps, canBeInlined0)) => canBeInlined0 && k != root && canBeInlined((inst, deps)) } match {
+        case None => None
+        case Some((k, (inst, dependees, _))) =>
+          assert(dependees.length == 1)
+          val (dependeeInst, dependeeDependedOnBy, canBeInlined0) = dict(dependees.head)
+          val inliner = new Inliner(inst.name, inst.inst.get)
+          val dependeeInst0 = inliner.transform(dependeeInst.inst.get)
+
+          val dict0 =
+            if (inliner.count == 1)
+              (dict - k).updated(
+                dependees.head,
+                (
+                  dependeeInst.copy(
+                    dependsOn = dependeeInst.dependsOn.filterNot(_ =:= inst.instTpe),
+                    inst = Some(dependeeInst0)
+                  ),
+                  dependeeDependedOnBy,
+                  canBeInlined0
+                )
+              )
+            else
+              dict.updated(k, (inst, dependees, false))
+
+          Some(copy(dict = dict0))
+      }
+
+    @tailrec
+    final def optimize: Instances =
+      prioritySubstitute.orElse(inline) match {
+        case None =>
+          this
+        case Some(instances) =>
+          instances.optimize
+      }
+  }
+
+  def mkInstances(state: State)(primaryTpe: Type): (Tree, Type) = {
+    val instances0 = Instances(state, primaryTpe).optimize
+
+    val instances = instances0.dict.toList.map(_._2._1)
+    val (from, to) = instances.map { d => (d.symbol, NoSymbol) }.unzip
+
+    def clean(inst: Tree) = {
+      val cleanInst = c.untypecheck(c.internal.substituteSymbols(inst, from, to))
+      new StripUnApplyNodes().transform(cleanInst)
+    }
+
+    if (instances.length == 1) {
+      val instance = instances.head
+      import instance._
+      inst match {
+        case Some(inst) =>
+          val cleanInst = clean(inst)
+          (q"$cleanInst.asInstanceOf[$actualTpe]", actualTpe)
+        case None =>
+          abort(s"Uninitialized $instTpe lazy implicit")
+      }
+    } else {
+      val instTrees =
+        instances.map { instance =>
+          import instance._
+          inst match {
+            case Some(inst) =>
+              val cleanInst = clean(inst)
+              q"""lazy val $name: $actualTpe = $cleanInst.asInstanceOf[$actualTpe]"""
+            case None =>
+              abort(s"Uninitialized $instTpe lazy implicit")
+          }
+        }
+
+      val primaryInstance = state.lookup(primaryTpe).right.get._2
+      val primaryNme = primaryInstance.name
+      val clsName = TypeName(c.freshName(state.name))
+
+      val tree =
+        q"""
+          final class $clsName extends _root_.scala.Serializable {
+            ..$instTrees
+          }
+          (new $clsName).$primaryNme
+         """
+      val actualType = primaryInstance.actualTpe
+
+      (tree, actualType)
+    }
   }
 }
