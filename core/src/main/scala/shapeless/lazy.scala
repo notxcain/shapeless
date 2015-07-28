@@ -47,6 +47,23 @@ object Lazy {
   def values[T <: HList](implicit lv: Lazy[Values[T]]): T = lv.value.values
 
   implicit def mkLazy[I]: Lazy[I] = macro LazyMacros.mkLazyImpl[I]
+
+  trait Cached[+T] extends Lazy[T] {
+    override def map[U](f: T => U): Cached[U] = Cached { f(value) }
+    def flatMap[U](f: T => Cached[U]): Cached[U] = Cached { f(value).value }
+  }
+
+  object Cached {
+    implicit def apply[T](t: => T): Cached[T] =
+      new Cached[T] {
+        val value = t
+      }
+
+    def unapply[T](lt: Cached[T]): Option[T] = Some(lt.value)
+
+    implicit def mkCached[I]: Cached[I] = macro LazyMacros.mkCachedLazyImpl[I]
+  }
+
 }
 
 object lazily {
@@ -69,6 +86,23 @@ object Strict {
   def unapply[T](lt: Strict[T]): Option[T] = Some(lt.value)
 
   implicit def mkStrict[I]: Strict[I] = macro LazyMacros.mkStrictImpl[I]
+
+  trait Cached[+T] extends Strict[T] {
+    override def map[U](f: T => U): Cached[U] = Cached { f(value) }
+    def flatMap[U](f: T => Cached[U]): Cached[U] = Cached { f(value).value }
+  }
+
+  object Cached {
+    implicit def apply[T](t: T): Cached[T] =
+      new Cached[T] {
+        val value = t
+      }
+
+    def unapply[T](lt: Cached[T]): Option[T] = Some(lt.value)
+
+    implicit def mkCached[I]: Cached[I] = macro LazyMacros.mkCachedStrictImpl[I]
+  }
+
 }
 
 class LazyMacros(val c: whitebox.Context) {
@@ -76,22 +110,41 @@ class LazyMacros(val c: whitebox.Context) {
   import c.ImplicitCandidate
 
   def mkLazyImpl[I](implicit iTag: WeakTypeTag[I]): Tree =
-    mkImpl[I](strict = false)
+    mkImpl[I](
+      (tree, actualType) => q"_root_.shapeless.Lazy.apply[$actualType]($tree)",
+      q"null.asInstanceOf[_root_.shapeless.Lazy[Nothing]]",
+      None
+    )
 
   def mkStrictImpl[I](implicit iTag: WeakTypeTag[I]): Tree =
-    mkImpl[I](strict = true)
+    mkImpl[I](
+      (tree, actualType) => q"_root_.shapeless.Strict.apply[$actualType]($tree)",
+      q"null.asInstanceOf[_root_.shapeless.Strict[Nothing]]",
+      None
+    )
 
-  def mkImpl[I](strict: Boolean)(implicit iTag: WeakTypeTag[I]): Tree = {
+  def mkCachedLazyImpl[I](implicit iTag: WeakTypeTag[I]): Tree =
+    mkImpl[I](
+      (tree, actualType) => q"_root_.shapeless.Lazy.Cached.apply[$actualType]($tree)",
+      q"null.asInstanceOf[_root_.shapeless.Lazy.Cached[Nothing]]",
+      Some("")
+    )
+
+  def mkCachedStrictImpl[I](implicit iTag: WeakTypeTag[I]): Tree =
+    mkImpl[I](
+      (tree, actualType) => q"_root_.shapeless.Strict.Cached.apply[$actualType]($tree)",
+      q"null.asInstanceOf[_root_.shapeless.Strict.Cached[Nothing]]",
+      Some("")
+    )
+
+  def mkImpl[I](mkInst: (c.Tree, c.Type) => c.Tree, nullInst: => c.Tree, cacheOpt: Option[String])(implicit iTag: WeakTypeTag[I]): Tree = {
     (c.openImplicits.headOption, iTag.tpe.dealias) match {
       case (Some(ImplicitCandidate(_, _, TypeRef(_, _, List(tpe)), _)), _) =>
-        LazyMacros.deriveInstance(c)(tpe.map(_.dealias), strict)
+        LazyMacros.deriveInstance(c)(tpe.map(_.dealias), mkInst, cacheOpt)
       case (None, tpe) if tpe.typeSymbol.isParameter =>       // Workaround for presentation compiler
-        if (strict)
-          q"null.asInstanceOf[_root_.shapeless.Strict[Nothing]]"
-        else
-          q"null.asInstanceOf[_root_.shapeless.Lazy[Nothing]]"
+        nullInst
       case (None, tpe) =>                                     // Non-implicit invocation
-        LazyMacros.deriveInstance(c)(tpe, strict)
+        LazyMacros.deriveInstance(c)(tpe, mkInst, cacheOpt)
       case _ =>
         c.abort(c.enclosingPosition, s"Bad Lazy materialization ${c.openImplicits.head}")
     }
@@ -99,6 +152,8 @@ class LazyMacros(val c: whitebox.Context) {
 }
 
 object LazyMacros {
+  var caches = Map.empty[String, List[(Any, Any)]]
+
   var dcRef: Option[DerivationContext] = None
 
   object Debug {
@@ -114,35 +169,65 @@ object LazyMacros {
     }
   }
 
-  def deriveInstance(c: whitebox.Context)(tpe: c.Type, strict: Boolean): c.Tree = {
-    val (dc, root) =
-      dcRef match {
-        case None =>
-          val dc = DerivationContext(c)
-          dcRef = Some(dc)
-          (dc, true)
-        case Some(dc) =>
-          (DerivationContext.establish(dc, c), false)
+  def deriveInstance(c: whitebox.Context)(tpe: c.Type, mkInst: (c.Tree, c.Type) => c.Tree, cacheOpt: Option[String]): c.Tree = {
+    val cached =
+      if (dcRef.isEmpty)
+        cacheOpt.flatMap(caches.get).flatMap { cache =>
+          cache.collectFirst {
+            case (tpe0, v) if tpe0.asInstanceOf[c.Type] =:= tpe =>
+              val res = v.asInstanceOf[c.Tree]
+              if (Debug.verbose)
+                println(s"Cache hit ($cacheOpt): $tpe")
+              res
+          }
+        }
+      else
+        None
+
+    def derive: c.Tree = {
+      val (dc, root) =
+        dcRef match {
+          case None =>
+            val dc = DerivationContext(c)
+            dcRef = Some(dc)
+            (dc, true)
+          case Some(dc) =>
+            (DerivationContext.establish(dc, c), false)
+        }
+
+      if (Debug.verbose && root) {
+        if (Debug.startTime == 0L)
+          Debug.startTime = System.currentTimeMillis()
+        Debug.count += 1
+        println(s"Deriving $tpe ${Seq(Debug.count.toString, ((System.currentTimeMillis() - Debug.startTime) / 1000.0).toString).mkString("(", ", ", ")")}")
       }
 
-    if (Debug.verbose && root) {
-      if (Debug.startTime == 0L)
-        Debug.startTime = System.currentTimeMillis()
-      Debug.count += 1
-      println(s"Deriving $tpe ${Seq(Debug.count.toString, ((System.currentTimeMillis() - Debug.startTime) / 1000.0).toString).mkString("(", ", ", ")")}")
+      if (Debug.verbose)
+        println(s"Deriving $tpe")
+
+      if (root)
+        // Sometimes corrupted, and slows things too
+        c.universe.asInstanceOf[scala.tools.nsc.Global].analyzer.resetImplicits()
+
+      try {
+        val res =
+        dc.State.deriveInstance(tpe, root, mkInst)
+        if (Debug.verbose)
+          println(s"Derived $tpe:\n  $res")
+        res
+      } finally {
+        if(root) dcRef = None
+      }
     }
 
-    if (Debug.verbose)
-      println(s"Deriving $tpe")
-
-    if (root)
-      // Sometimes corrupted, and slows things too
-      c.universe.asInstanceOf[scala.tools.nsc.Global].analyzer.resetImplicits()
-
-    try {
-      dc.State.deriveInstance(tpe, root, strict)
-    } finally {
-      if(root) dcRef = None
+    cached.getOrElse{
+      if (Debug.verbose && dcRef.isEmpty)
+        println(s"Cache miss ($cacheOpt): $tpe")
+      val res = derive
+      if (dcRef.isEmpty)
+        for (cache <- cacheOpt)
+          LazyMacros.caches += cache -> ((tpe, res) :: LazyMacros.caches.getOrElse(cache, Nil))
+      res
     }
   }
 }
@@ -296,7 +381,7 @@ trait DerivationContext extends shapeless.CaseClassMacros with LazyDefinitions {
         else Some((state0, tree))
       }
 
-    def deriveInstance(instTpe0: Type, root: Boolean, strict: Boolean): Tree = {
+    def deriveInstance(instTpe0: Type, root: Boolean, mkInst: (Tree, Type) => Tree): Tree = {
       if (root) {
         assert(current.isEmpty)
         val open = c.openImplicits
@@ -308,10 +393,7 @@ trait DerivationContext extends shapeless.CaseClassMacros with LazyDefinitions {
         case Right((state, inst)) =>
           val (tree, actualType) = if (root) mkInstances(state)(instTpe0) else (inst.ident, inst.actualTpe)
           current = if (root) None else Some(state)
-          if (strict)
-            q"_root_.shapeless.Strict.apply[$actualType]($tree)"
-          else
-            q"_root_.shapeless.Lazy.apply[$actualType]($tree)"
+          mkInst(tree, actualType)
         case Left(err) =>
           abort(err)
       }
@@ -540,7 +622,9 @@ trait DerivationContext extends shapeless.CaseClassMacros with LazyDefinitions {
           val dependeeInst0 = inliner.transform(dependeeInst.inst.get)
 
           val dict0 =
-            if (inliner.count == 1)
+            if (inliner.count == 1) {
+              if (LazyMacros.Debug.verbose)
+                println(s"Inlined ${inst.instTpe}")
               (dict - k).updated(
                 dependees.head,
                 (
@@ -552,7 +636,7 @@ trait DerivationContext extends shapeless.CaseClassMacros with LazyDefinitions {
                   canBeInlined0
                 )
               )
-            else
+            } else
               dict.updated(k, (inst, dependees, false))
 
           Some(copy(dict = dict0))
