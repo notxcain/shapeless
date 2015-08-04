@@ -269,7 +269,7 @@ trait LazyExtension {
 trait LazyExtensionCompanion {
   def instantiate(ctx0: DerivationContext): LazyExtension { type Ctx = ctx0.type }
 
-  def initImpl(c: whitebox.Context): c.universe.Tree = {
+  def initImpl(c: whitebox.Context): Nothing = {
     val ctx = LazyMacros.dcRef.getOrElse(
       c.abort(c.enclosingPosition, "")
     )
