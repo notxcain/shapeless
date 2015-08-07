@@ -234,7 +234,7 @@ object SerializationTestDefns {
 
 }
 
-class SerializationTests {
+class SerializationTests extends Serializable {
   import SerializationTestDefns._
 
   @Test
